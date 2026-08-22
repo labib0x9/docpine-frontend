@@ -1,5 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { createRoot } from "react-dom/client";
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import "@xterm/xterm/css/xterm.css";
 
 const TTL = 300; // seconds
 const API_BASE = "http://localhost:8080";
@@ -36,8 +39,8 @@ const CSS = `
     display: flex;
     flex-direction: column;
     width: 100%;
-    max-width: 560px;
-    height: min(480px, 80vh);
+    max-width: 640px;
+    height: min(520px, 80vh);
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 10px;
@@ -58,13 +61,17 @@ const CSS = `
   .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
   .status-dot.running { background: var(--green); }
   .status-dot.expiring { background: var(--red); animation: pulse 1s infinite; }
+  .status-dot.disconnected { background: #ffaa00; }
+  .status-dot.expired { background: var(--muted); }
   @keyframes pulse { 50% { opacity: 0.3; } }
 
   .ttl { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .ttl.expiring { color: var(--red); }
 
-  .header-right { margin-left: auto; }
-  .kill-btn {
+  .status-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+
+  .header-right { margin-left: auto; display: flex; gap: 8px; }
+  .kill-btn, .reconnect-btn {
     background: none;
     border: 1px solid var(--border);
     color: var(--muted);
@@ -75,41 +82,32 @@ const CSS = `
     border-radius: 3px;
   }
   .kill-btn:hover { border-color: var(--red); color: var(--red); }
+  .reconnect-btn { border-color: var(--green); color: var(--green); }
+  .reconnect-btn:hover { background: #00ff8815; }
+  .reconnect-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-  .output {
+  .term-wrap {
     flex: 1;
-    overflow-y: auto;
-    padding: 16px 18px;
-    font-size: 12.5px;
-    line-height: 1.7;
-    white-space: pre-wrap;
+    min-height: 0;
+    padding: 10px 12px 0;
+    position: relative;
   }
-  .output::-webkit-scrollbar { width: 4px; }
-  .output::-webkit-scrollbar-thumb { background: var(--border); }
+  .term-wrap .xterm { height: 100%; }
+  .term-wrap .xterm-viewport::-webkit-scrollbar { width: 4px; }
+  .term-wrap .xterm-viewport::-webkit-scrollbar-thumb { background: var(--border); }
 
-  .line.system { color: var(--muted); }
-  .line.error { color: var(--red); }
-
-  .input-row {
+  .overlay {
+    position: absolute;
+    inset: 0;
     display: flex;
+    flex-direction: column;
     align-items: center;
-    gap: 8px;
-    padding: 10px 18px;
-    border-top: 1px solid var(--border);
-    flex-shrink: 0;
+    justify-content: center;
+    gap: 10px;
+    background: rgba(13, 13, 13, 0.85);
+    text-align: center;
   }
-  .prompt { color: var(--green); }
-  .input {
-    flex: 1;
-    background: none;
-    border: none;
-    outline: none;
-    color: var(--text);
-    font-family: var(--mono);
-    font-size: 12.5px;
-    caret-color: var(--green);
-  }
-  .input::placeholder { color: var(--muted); }
+  .overlay-msg { font-size: 12px; color: var(--muted); }
 
   .empty { flex: 1; display: flex; align-items: center; justify-content: center; }
   .start-btn {
@@ -132,85 +130,154 @@ function fmtTTL(s) {
   return `${m}:${sec}`;
 }
 
+const XTERM_THEME = {
+  background: "#141414",
+  foreground: "#d8d8d8",
+  cursor: "#00ff88",
+  cursorAccent: "#141414",
+  selectionBackground: "#00ff8833",
+  black: "#141414",
+  red: "#ff4455",
+  green: "#00ff88",
+  yellow: "#ffaa00",
+  blue: "#5599ff",
+  magenta: "#cc88ff",
+  cyan: "#55ddff",
+  white: "#d8d8d8",
+  brightBlack: "#666666",
+};
+
 export default function App() {
+  // status: idle | running | expiring | disconnected | expired
   const [session, setSession] = useState(null); // { id, status, remaining }
-  const [lines, setLines] = useState([]);
-  const [input, setInput] = useState("");
   const [connecting, setConnecting] = useState(false);
 
   const wsRef = useRef(null);
-  const outputRef = useRef(null);
-  const inputRef = useRef(null);
+  const termRef = useRef(null);
+  const fitAddonRef = useRef(null);
+  const termContainerRef = useRef(null);
+  const manualCloseRef = useRef(false);
+  const ttlExpiredRef = useRef(false);
 
+  // --- terminal lifecycle: created once, reused across reconnects ---
   useEffect(() => {
-    if (outputRef.current) outputRef.current.scrollTop = outputRef.current.scrollHeight;
-  }, [lines]);
+    const term = new Terminal({
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: 13,
+      lineHeight: 1.4,
+      cursorBlink: true,
+      theme: XTERM_THEME,
+      scrollback: 5000,
+      convertEol: true,
+    });
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(termContainerRef.current);
+    fitAddon.fit();
 
-  useEffect(() => {
-    if (session?.status === "running") inputRef.current?.focus();
-  }, [session]);
+    term.onData(data => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(data);
+      }
+    });
 
-  // TTL countdown
+    termRef.current = term;
+    fitAddonRef.current = fitAddon;
+
+    const onResize = () => fitAddonRef.current?.fit();
+    window.addEventListener("resize", onResize);
+    const ro = new ResizeObserver(onResize);
+    ro.observe(termContainerRef.current);
+
+    return () => {
+      window.removeEventListener("resize", onResize);
+      ro.disconnect();
+      term.dispose();
+    };
+  }, []);
+
+  // re-fit whenever the terminal becomes visible (display:none has zero dimensions,
+  // so fit() calls made while hidden are no-ops)
   useEffect(() => {
-    if (!session || session.status !== "running") return;
+    if (session) requestAnimationFrame(() => fitAddonRef.current?.fit());
+  }, [!!session]);
+
+  // TTL countdown — only ticks while actually attached
+  useEffect(() => {
+    if (!session || (session.status !== "running" && session.status !== "expiring")) return;
     const t = setInterval(() => {
       setSession(s => {
         if (!s) return s;
         const remaining = s.remaining - 1;
         if (remaining <= 0) {
+          ttlExpiredRef.current = true;
+          manualCloseRef.current = true; // expected close, don't trigger auto-reconnect UI
           wsRef.current?.close();
+          termRef.current?.writeln("\r\n\x1b[90m[session expired]\x1b[0m");
           return { ...s, remaining: 0, status: "expired" };
         }
         return { ...s, remaining, status: remaining <= 60 ? "expiring" : "running" };
       });
     }, 1000);
     return () => clearInterval(t);
-  }, [session?.status === "running"]);
+  }, [session?.status]);
 
-  const appendLine = useCallback((text, type = "output") => {
-    setLines(prev => [...prev, { text, type }]);
+  const attach = useCallback((id, remaining) => {
+    manualCloseRef.current = false;
+    const ws = new WebSocket(`${WS_BASE}/sessions/${id}/attach`);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setSession({ id, status: remaining <= 60 ? "expiring" : "running", remaining });
+      fitAddonRef.current?.fit();
+    };
+    ws.onmessage = e => termRef.current?.write(e.data);
+    ws.onclose = () => {
+      if (manualCloseRef.current) return; // kill or TTL expiry already handled state
+      // unexpected drop while session should still be alive server-side
+      termRef.current?.writeln("\r\n\x1b[33m[disconnected — reconnect to resume]\x1b[0m");
+      setSession(s => (s ? { ...s, status: "disconnected" } : s));
+    };
+    ws.onerror = () => termRef.current?.writeln("\r\n\x1b[31m[connection error]\x1b[0m");
   }, []);
 
   const startSession = useCallback(async () => {
     setConnecting(true);
+    ttlExpiredRef.current = false;
     try {
       const res = await fetch(`${API_BASE}/sessions`, { method: "POST" });
       const data = await res.json();
-
-      const id = data.id;
-      setSession({ id, status: "running", remaining: TTL });
-      setLines([]);
-
-      const ws = new WebSocket(`${WS_BASE}/sessions/${id}`);
-      wsRef.current = ws;
-
-      ws.onmessage = e => appendLine(e.data);
-      ws.onclose = () => {
-        setSession(s => (s ? { ...s, status: "expired" } : s));
-      };
-      ws.onerror = () => appendLine("connection error", "error");
+      termRef.current?.clear();
+      termRef.current?.reset();
+      attach(data.container_id, TTL);
     } catch {
-      appendLine("failed to create session", "error");
+      termRef.current?.writeln("\x1b[31mfailed to create session\x1b[0m");
     } finally {
       setConnecting(false);
     }
-  }, [appendLine]);
+  }, [attach]);
+
+  const reconnect = useCallback(() => {
+    if (!session) return;
+    // TTL already ran out server-side too — the old container is gone, start fresh
+    if (session.status === "expired" || ttlExpiredRef.current) {
+      startSession();
+      return;
+    }
+    // ws just dropped but the container should still be within its TTL window —
+    // reattach to the same id and resume the existing countdown
+    setConnecting(true);
+    attach(session.id, session.remaining);
+    setConnecting(false);
+  }, [session, attach, startSession]);
 
   const killSession = useCallback(() => {
+    manualCloseRef.current = true;
     wsRef.current?.close();
     setSession(s => (s ? { ...s, status: "expired" } : s));
   }, []);
 
-  const sendCommand = useCallback(() => {
-    const cmd = input.trim();
-    setInput("");
-    if (!cmd || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-    wsRef.current.send(cmd);
-  }, [input]);
-
-  const handleKey = e => {
-    if (e.key === "Enter") sendCommand();
-  };
+  const showOverlay = session && (session.status === "disconnected" || session.status === "expired");
 
   return (
     <>
@@ -221,40 +288,44 @@ export default function App() {
           {session && (
             <>
               <span className={`status-dot ${session.status}`} />
-              <span className={`ttl ${session.status === "expiring" ? "expiring" : ""}`}>
-                {fmtTTL(session.remaining)}
-              </span>
+              {session.status === "running" || session.status === "expiring" ? (
+                <span className={`ttl ${session.status === "expiring" ? "expiring" : ""}`}>
+                  {fmtTTL(session.remaining)}
+                </span>
+              ) : (
+                <span className="status-label">{session.status}</span>
+              )}
             </>
           )}
           <div className="header-right">
-            {session && session.status !== "expired" && (
+            {session && (session.status === "running" || session.status === "expiring") && (
               <button className="kill-btn" onClick={killSession}>kill</button>
+            )}
+            {session && (session.status === "disconnected" || session.status === "expired") && (
+              <button className="reconnect-btn" onClick={reconnect} disabled={connecting}>
+                {connecting ? "reconnecting..." : "reconnect"}
+              </button>
             )}
           </div>
         </div>
 
-        {session ? (
-          <>
-            <div className="output" ref={outputRef}>
-              {lines.map((l, i) => (
-                <div key={i} className={`line ${l.type}`}>{l.text}</div>
-              ))}
+        {/* term-wrap is always mounted so the xterm instance (created once in the
+            effect above) never gets detached — visibility toggles via overlays */}
+        <div className="term-wrap" ref={termContainerRef} style={{ display: session ? "block" : "none" }}>
+          {showOverlay && (
+            <div className="overlay">
+              <span className="overlay-msg">
+                {session.status === "expired"
+                  ? "session expired — reconnecting starts a new one"
+                  : "connection dropped — reconnect to resume this session"}
+              </span>
+              <button className="reconnect-btn" onClick={reconnect} disabled={connecting}>
+                {connecting ? "reconnecting..." : "reconnect"}
+              </button>
             </div>
-            <div className="input-row">
-              <span className="prompt">❯</span>
-              <input
-                ref={inputRef}
-                className="input"
-                value={input}
-                onChange={e => setInput(e.target.value)}
-                onKeyDown={handleKey}
-                spellCheck={false}
-                autoComplete="off"
-                disabled={session.status === "expired"}
-              />
-            </div>
-          </>
-        ) : (
+          )}
+        </div>
+        {!session && (
           <div className="empty">
             <button className="start-btn" onClick={startSession} disabled={connecting}>
               {connecting ? "starting..." : "start session"}
