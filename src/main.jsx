@@ -61,7 +61,6 @@ const CSS = `
   .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
   .status-dot.running { background: var(--green); }
   .status-dot.expiring { background: var(--red); animation: pulse 1s infinite; }
-  .status-dot.disconnected { background: #ffaa00; }
   .status-dot.expired { background: var(--muted); }
   @keyframes pulse { 50% { opacity: 0.3; } }
 
@@ -148,7 +147,7 @@ const XTERM_THEME = {
 };
 
 export default function App() {
-  // status: idle | running | expiring | disconnected | expired
+  // status: idle | running | expiring | expired
   const [session, setSession] = useState(null); // { id, status, remaining }
   const [connecting, setConnecting] = useState(false);
 
@@ -157,7 +156,6 @@ export default function App() {
   const fitAddonRef = useRef(null);
   const termContainerRef = useRef(null);
   const manualCloseRef = useRef(false);
-  const ttlExpiredRef = useRef(false);
 
   // --- terminal lifecycle: created once, reused across reconnects ---
   useEffect(() => {
@@ -210,7 +208,6 @@ export default function App() {
         if (!s) return s;
         const remaining = s.remaining - 1;
         if (remaining <= 0) {
-          ttlExpiredRef.current = true;
           manualCloseRef.current = true; // expected close, don't trigger auto-reconnect UI
           wsRef.current?.close();
           termRef.current?.writeln("\r\n\x1b[90m[session expired]\x1b[0m");
@@ -234,16 +231,15 @@ export default function App() {
     ws.onmessage = e => termRef.current?.write(e.data);
     ws.onclose = () => {
       if (manualCloseRef.current) return; // kill or TTL expiry already handled state
-      // unexpected drop while session should still be alive server-side
-      termRef.current?.writeln("\r\n\x1b[33m[disconnected — reconnect to resume]\x1b[0m");
-      setSession(s => (s ? { ...s, status: "disconnected" } : s));
+      // any drop (network blip, server restart, etc.) — reconnect always spins up a new container
+      termRef.current?.writeln("\r\n\x1b[33m[disconnected — reconnect to start a new session]\x1b[0m");
+      setSession(s => (s ? { ...s, status: "expired" } : s));
     };
     ws.onerror = () => termRef.current?.writeln("\r\n\x1b[31m[connection error]\x1b[0m");
   }, []);
 
   const startSession = useCallback(async () => {
     setConnecting(true);
-    ttlExpiredRef.current = false;
     try {
       const res = await fetch(`${API_BASE}/sessions`, { method: "POST" });
       const data = await res.json();
@@ -257,19 +253,10 @@ export default function App() {
     }
   }, [attach]);
 
+  // any reconnect — whether from TTL expiry or a dropped connection — spins up a new container
   const reconnect = useCallback(() => {
-    if (!session) return;
-    // TTL already ran out server-side too — the old container is gone, start fresh
-    if (session.status === "expired" || ttlExpiredRef.current) {
-      startSession();
-      return;
-    }
-    // ws just dropped but the container should still be within its TTL window —
-    // reattach to the same id and resume the existing countdown
-    setConnecting(true);
-    attach(session.id, session.remaining);
-    setConnecting(false);
-  }, [session, attach, startSession]);
+    startSession();
+  }, [startSession]);
 
   const killSession = useCallback(() => {
     manualCloseRef.current = true;
@@ -277,7 +264,7 @@ export default function App() {
     setSession(s => (s ? { ...s, status: "expired" } : s));
   }, []);
 
-  const showOverlay = session && (session.status === "disconnected" || session.status === "expired");
+  const showOverlay = session && session.status === "expired";
 
   return (
     <>
@@ -301,7 +288,7 @@ export default function App() {
             {session && (session.status === "running" || session.status === "expiring") && (
               <button className="kill-btn" onClick={killSession}>kill</button>
             )}
-            {session && (session.status === "disconnected" || session.status === "expired") && (
+            {session && session.status === "expired" && (
               <button className="reconnect-btn" onClick={reconnect} disabled={connecting}>
                 {connecting ? "reconnecting..." : "reconnect"}
               </button>
@@ -314,11 +301,7 @@ export default function App() {
         <div className="term-wrap" ref={termContainerRef} style={{ display: session ? "block" : "none" }}>
           {showOverlay && (
             <div className="overlay">
-              <span className="overlay-msg">
-                {session.status === "expired"
-                  ? "session expired — reconnecting starts a new one"
-                  : "connection dropped — reconnect to resume this session"}
-              </span>
+              <span className="overlay-msg">session ended — reconnect to start a new one</span>
               <button className="reconnect-btn" onClick={reconnect} disabled={connecting}>
                 {connecting ? "reconnecting..." : "reconnect"}
               </button>
