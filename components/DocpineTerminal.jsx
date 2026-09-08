@@ -1,16 +1,17 @@
+"use client";
+
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { createRoot } from "react-dom/client";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import "./index.css";
+import ErrorBoundary from "./ErrorBoundary";
 
 // ============================================================================
 // CONFIGURATION & THEMES
 // ============================================================================
 const DEFAULT_TTL = 300; // 5 minutes in seconds
-const DEFAULT_API_BASE = "http://127.0.0.1:8080";
-const DEFAULT_WS_BASE = "ws://127.0.0.1:8080";
+const DEFAULT_API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8080";
+const DEFAULT_WS_BASE = process.env.NEXT_PUBLIC_WS_BASE || "ws://127.0.0.1:8080";
 
 const THEMES = {
   emerald: {
@@ -208,90 +209,6 @@ const THEMES = {
 };
 
 // ============================================================================
-// REACT ERROR BOUNDARY COMPONENT
-// ============================================================================
-class ErrorBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false, error: null };
-  }
-
-  static getDerivedStateFromError(error) {
-    return { hasError: true, error };
-  }
-
-  componentDidCatch(error, errorInfo) {
-    console.error("Docpine UI ErrorBoundary caught an exception:", error, errorInfo);
-  }
-
-  handleReload = () => {
-    window.location.reload();
-  };
-
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div style={{
-          height: "100%",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: 24,
-          background: "#0a0d0f",
-          color: "#f8fafc",
-          fontFamily: "'JetBrains Mono', monospace"
-        }}>
-          <div style={{
-            maxWidth: 540,
-            width: "100%",
-            background: "#141c22",
-            border: "1px solid #ff4757",
-            borderRadius: 12,
-            padding: 28,
-            boxShadow: "0 20px 50px rgba(0,0,0,0.7)"
-          }}>
-            <h2 style={{ fontSize: 18, color: "#ff4757", marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}>
-              ⚠️ Application Render Error
-            </h2>
-            <p style={{ fontSize: 13, color: "#94a3b8", marginBottom: 16, lineHeight: 1.5 }}>
-              An unhandled rendering exception occurred in Docpine UI.
-            </p>
-            <div style={{
-              background: "#090d0f",
-              padding: 12,
-              borderRadius: 6,
-              fontSize: 11,
-              color: "#fca5a5",
-              maxHeight: 140,
-              overflowY: "auto",
-              marginBottom: 20
-            }}>
-              {this.state.error?.toString() || "Unknown error"}
-            </div>
-            <button
-              onClick={this.handleReload}
-              style={{
-                background: "#00f5a0",
-                color: "#090d0f",
-                border: "none",
-                borderRadius: 6,
-                padding: "8px 18px",
-                fontWeight: 600,
-                cursor: "pointer",
-                fontFamily: "inherit"
-              }}
-            >
-              Reload Interface
-            </button>
-          </div>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
-
-// ============================================================================
 // FORMAT HELPERS
 // ============================================================================
 function fmtTTL(seconds) {
@@ -301,9 +218,9 @@ function fmtTTL(seconds) {
 }
 
 // ============================================================================
-// MAIN APP COMPONENT
+// MAIN TERMINAL COMPONENT
 // ============================================================================
-export default function App() {
+export default function DocpineTerminal() {
   const [session, setSession] = useState(null);
   const [connecting, setConnecting] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -1004,8 +921,3 @@ export default function App() {
     </ErrorBoundary>
   );
 }
-
-// ============================================================================
-// ROOT ATTACHMENT
-// ============================================================================
-createRoot(document.getElementById("root")).render(<App />);
