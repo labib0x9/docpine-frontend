@@ -5,13 +5,14 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import ErrorBoundary from "./ErrorBoundary";
+import { solvePoW } from "../lib/powSolver";
 
 // ============================================================================
 // CONFIGURATION & THEMES
 // ============================================================================
 const DEFAULT_TTL = 300; // 5 minutes in seconds
-const DEFAULT_API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8080";
-const DEFAULT_WS_BASE = process.env.NEXT_PUBLIC_WS_BASE || "ws://127.0.0.1:8080";
+const ENV_API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8080";
+const ENV_WS_BASE = process.env.NEXT_PUBLIC_WS_BASE || "ws://127.0.0.1:8080";
 
 const THEMES = {
   emerald: {
@@ -220,17 +221,24 @@ function fmtTTL(seconds) {
 // ============================================================================
 // MAIN TERMINAL COMPONENT
 // ============================================================================
-export default function DocpineTerminal() {
+export function DocpineTerminal({
+  apiBaseUrl = ENV_API_BASE,
+  wsBaseUrl = ENV_WS_BASE,
+}) {
   const [session, setSession] = useState(null);
   const [connecting, setConnecting] = useState(false);
+  const [powSolving, setPowSolving] = useState(false);
+  const [rateLimitCountdown, setRateLimitCountdown] = useState(0);
+  const [capacityCountdown, setCapacityCountdown] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [currentTheme, setCurrentTheme] = useState("emerald");
   const [fontSize, setFontSize] = useState(13);
-  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [isOnline, setIsOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [diagnosticError, setDiagnosticError] = useState("");
   const [toasts, setToasts] = useState([]);
   const [backendAlive, setBackendAlive] = useState(null);
+  const [healthData, setHealthData] = useState(null);
 
   const wsRef = useRef(null);
   const termRef = useRef(null);
@@ -256,6 +264,7 @@ export default function DocpineTerminal() {
   // NETWORK MONITORING
   // --------------------------------------------------------------------------
   useEffect(() => {
+    if (typeof window === "undefined") return;
     const handleOnline = () => {
       setIsOnline(true);
       showToast("Network Connected", "Internet connection restored", "success");
@@ -273,21 +282,68 @@ export default function DocpineTerminal() {
   }, [showToast]);
 
   // --------------------------------------------------------------------------
-  // BACKEND HEALTH PROBE
+  // RATE LIMIT COUNTDOWN TICKER
+  // --------------------------------------------------------------------------
+  useEffect(() => {
+    if (rateLimitCountdown <= 0) return;
+    const timer = setInterval(() => {
+      setRateLimitCountdown(prev => (prev > 1 ? prev - 1 : 0));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [rateLimitCountdown]);
+
+  // --------------------------------------------------------------------------
+  // CAPACITY LIMIT COUNTDOWN TICKER
+  // --------------------------------------------------------------------------
+  useEffect(() => {
+    if (capacityCountdown <= 0) return;
+    const timer = setInterval(() => {
+      setCapacityCountdown(prev => (prev > 1 ? prev - 1 : 0));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [capacityCountdown]);
+
+  // --------------------------------------------------------------------------
+  // BACKEND HEALTH PROBE (/healthz)
   // --------------------------------------------------------------------------
   useEffect(() => {
     let isMounted = true;
     const probe = async () => {
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 2000);
-        const res = await fetch(`${DEFAULT_API_BASE}/sessions`, {
-          method: "OPTIONS",
+        const timeoutId = setTimeout(() => controller.abort(), 3000);
+
+        // Core Endpoint 1: GET /healthz with credentials: "include"
+        const res = await fetch(`${apiBaseUrl}/healthz`, {
+          method: "GET",
+          headers: { Accept: "application/json" },
+          credentials: "include",
           signal: controller.signal,
-        }).catch(() => null);
+        }).catch(async () => {
+          // Fallback probe if /healthz route is not implemented yet
+          return await fetch(`${apiBaseUrl}/sessions`, {
+            method: "OPTIONS",
+            credentials: "include",
+            signal: controller.signal,
+          }).catch(() => null);
+        });
+
         clearTimeout(timeoutId);
-        if (isMounted) {
-          setBackendAlive(Boolean(res && (res.ok || res.status === 405 || res.status === 200 || res.status === 204)));
+
+        if (!isMounted) return;
+
+        if (res && (res.ok || res.status === 200 || res.status === 204)) {
+          setBackendAlive(true);
+          try {
+            const data = await res.json();
+            setHealthData(data);
+          } catch {
+            // Non-JSON response
+          }
+        } else if (res && res.status === 405) {
+          setBackendAlive(true);
+        } else {
+          setBackendAlive(false);
         }
       } catch {
         if (isMounted) setBackendAlive(false);
@@ -300,7 +356,7 @@ export default function DocpineTerminal() {
       isMounted = false;
       clearInterval(interval);
     };
-  }, []);
+  }, [apiBaseUrl]);
 
   // --------------------------------------------------------------------------
   // INITIALIZE XTERM.JS
@@ -325,9 +381,17 @@ export default function DocpineTerminal() {
     term.open(termContainerRef.current);
     fitAddon.fit();
 
+    // Lane 1: Stream keystrokes from xterm.js directly to PTY stdin
     term.onData(data => {
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(data);
+      }
+    });
+
+    // Lane 2: Handle terminal resize events (out-of-band JSON control message)
+    term.onResize(({ cols, rows }) => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "resize", cols, rows }));
       }
     });
 
@@ -392,7 +456,7 @@ export default function DocpineTerminal() {
         if (nextRemaining <= 0) {
           manualCloseRef.current = true;
           wsRef.current?.close(1000, "TTL Expired");
-          termRef.current?.writeln("\r\n\x1b[38;2;255;71;87m[session expired — container destroyed]\x1b[0m\r\n");
+          termRef.current?.writeln("\r\n\x1b[38;2;255;71;87m[session expired — sandbox destroyed]\x1b[0m\r\n");
           return { ...s, remaining: 0, status: "expired" };
         }
 
@@ -405,12 +469,12 @@ export default function DocpineTerminal() {
   }, [sessionStatus]);
 
   // --------------------------------------------------------------------------
-  // WEBSOCKET ATTACHMENT WITH COMPLETE ERROR HANDLERS
+  // TWO-LANE WEBSOCKET PTY STREAM ATTACHMENT
   // --------------------------------------------------------------------------
-  const attachWebSocket = useCallback((containerId, totalTime) => {
+  const attachWebSocket = useCallback((sessionId, totalTime) => {
     manualCloseRef.current = false;
 
-    let wsUrl = `${DEFAULT_WS_BASE}/sessions/${containerId}/attach`;
+    let wsUrl = `${wsBaseUrl}/sessions/${sessionId}/attach`;
     wsUrl = wsUrl.replace(/([^:]\/)\/+/g, "$1");
 
     let isConnected = false;
@@ -424,24 +488,37 @@ export default function DocpineTerminal() {
         showToast("Connection Timeout", "WebSocket handshake timed out", "error");
         setSession(s => (s ? { ...s, status: "expired" } : null));
       }
-    }, 8000);
+    }, 10000);
 
     ws.onopen = () => {
       isConnected = true;
       clearTimeout(connectTimeout);
       setSession({
-        id: containerId,
+        id: sessionId,
         status: totalTime <= 60 ? "expiring" : "running",
         remaining: totalTime,
         totalTTL: totalTime,
       });
-      showToast("Connected to Container", `Session #${containerId.slice(0, 8)} attached`, "success");
+
+      // Send initial terminal dimensions (Lane 2 Control Message)
+      if (termRef.current) {
+        ws.send(
+          JSON.stringify({
+            type: "resize",
+            cols: termRef.current.cols,
+            rows: termRef.current.rows,
+          })
+        );
+      }
+
+      showToast("Sandbox Attached", `Session #${sessionId.slice(0, 8)} connected`, "success");
       window.requestAnimationFrame(() => {
         fitAddonRef.current?.fit();
         termRef.current?.focus();
       });
     };
 
+    // Lane 1: Stream PTY Output from container directly to xterm.js
     ws.onmessage = event => {
       termRef.current?.write(event.data);
     };
@@ -450,14 +527,14 @@ export default function DocpineTerminal() {
       clearTimeout(connectTimeout);
       if (manualCloseRef.current) return;
 
-      let reasonText = "Session disconnected";
+      let reasonText = "Session disconnected (Sandbox destroyed)";
       if (event.code === 1006) {
-        reasonText = "Abnormal disconnection (server dropped connection)";
+        reasonText = "Abnormal disconnection (Server dropped stream)";
       } else if (event.reason) {
         reasonText = `Disconnected: ${event.reason}`;
       }
 
-      termRef.current?.writeln(`\r\n\x1b[33m[${reasonText}]\x1b[0m\r\n`);
+      termRef.current?.writeln(`\r\n\x1b[31m[Session terminated — ${reasonText}]\x1b[0m\r\n`);
       showToast("Session Disconnected", reasonText, "error");
       setSession(s => (s ? { ...s, status: "expired" } : null));
     };
@@ -465,62 +542,154 @@ export default function DocpineTerminal() {
     ws.onerror = () => {
       clearTimeout(connectTimeout);
       termRef.current?.writeln("\r\n\x1b[31m[WebSocket stream error encountered]\x1b[0m");
-      showToast("WebSocket Error", "An error occurred with the socket connection", "error");
+      showToast("WebSocket Error", "An error occurred with the socket stream", "error");
     };
-  }, [showToast]);
+  }, [wsBaseUrl, showToast]);
 
   // --------------------------------------------------------------------------
-  // START LIVE DOCKER CONTAINER SESSION
+  // CREATE SESSION FLOW WITH PROOF-OF-WORK (PoW) & STATUS INTERCEPTION
   // --------------------------------------------------------------------------
   const startSession = useCallback(async () => {
-    if (connecting) return;
+    if (connecting || rateLimitCountdown > 0) return;
     setConnecting(true);
+    setPowSolving(false);
     setShowDiagnostics(false);
 
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 6000);
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
 
-      const res = await fetch(`${DEFAULT_API_BASE}/sessions`, {
+      // Core Request: POST /sessions with credentials: "include" for __dp_dev cookie
+      let res = await fetch(`${apiBaseUrl}/sessions`, {
         method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        credentials: "include", // Required for __dp_dev signed cookie
         signal: controller.signal,
       }).catch(err => {
-        throw new Error(err.name === "AbortError" ? "Backend request timed out (6s)" : `Cannot reach ${DEFAULT_API_BASE}. Is the Docpine Go backend running?`);
+        throw new Error(
+          err.name === "AbortError"
+            ? "Backend request timed out (12s)"
+            : `Cannot reach ${apiBaseUrl}. Is the Docpine backend running?`
+        );
       });
 
+      // Handle 428 Precondition Required (Proof-of-Work puzzle challenge)
+      if (res.status === 428) {
+        setPowSolving(true);
+        showToast("Solving Security Challenge", "Computing browser Proof-of-Work...", "info", 2000);
+
+        const challengeData = await res.json();
+        if (!challengeData.pow_challenge) {
+          throw new Error("HTTP 428 received but pow_challenge payload is missing");
+        }
+
+        const t0 = performance.now();
+        const solution = await solvePoW(challengeData.pow_challenge);
+        const elapsed = Math.round(performance.now() - t0);
+
+        setPowSolving(false);
+        showToast("Challenge Solved", `PoW verified in ${elapsed}ms`, "success", 2000);
+
+        // Re-send POST /sessions with solved PoW solution
+        res = await fetch(`${apiBaseUrl}/sessions`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          credentials: "include", // Preserves __dp_dev signed cookie
+          body: JSON.stringify({
+            pow_solution: solution,
+          }),
+        });
+      }
+
       clearTimeout(timeoutId);
+
+      // Handle 429 Too Many Requests (Per-client rate limit exceeded)
+      if (res.status === 429) {
+        const retryHeader = res.headers.get("Retry-After");
+        let retrySeconds = retryHeader ? parseInt(retryHeader, 10) : 15;
+
+        try {
+          const errData = await res.json();
+          if (errData.retry_after && typeof errData.retry_after === "number") {
+            retrySeconds = errData.retry_after;
+          }
+        } catch {
+          // Ignore JSON parse errors on error responses
+        }
+
+        if (isNaN(retrySeconds) || retrySeconds <= 0) retrySeconds = 15;
+        setRateLimitCountdown(retrySeconds);
+        showToast("Rate Limit Exceeded", `Please wait ${retrySeconds}s before creating a sandbox.`, "error", 5000);
+        return;
+      }
+
+      // Handle 503 Service Unavailable (Global 20-container capacity reached)
+      if (res.status === 503) {
+        const retryHeader = res.headers.get("Retry-After");
+        let retrySeconds = retryHeader ? parseInt(retryHeader, 10) : 30;
+
+        try {
+          const errData = await res.json();
+          if (errData.retry_after && typeof errData.retry_after === "number") {
+            retrySeconds = errData.retry_after;
+          }
+        } catch {
+          // Ignore JSON parse errors
+        }
+
+        if (isNaN(retrySeconds) || retrySeconds <= 0) retrySeconds = 30;
+        setCapacityCountdown(retrySeconds);
+        showToast(
+          "Host At Maximum Capacity",
+          "All 20/20 sandboxes are active. Please wait a moment.",
+          "error",
+          6000
+        );
+        return;
+      }
 
       if (!res.ok) {
         let errDetail = `HTTP ${res.status}: ${res.statusText}`;
         try {
           const errData = await res.json();
           if (errData.error || errData.message) {
-            errDetail = errData.error || errData.message;
+            errDetail = errData.message || errData.error;
           }
         } catch {
-          // ignore non-json error responses
+          // Non-JSON error body
         }
         throw new Error(errDetail);
       }
 
+      // Success Response (HTTP 201 Created or HTTP 200)
       const data = await res.json();
-      if (!data.container_id) {
-        throw new Error("Invalid response from server: container_id missing");
+      const sessionId = data.session_id || data.container_id;
+      const ttl = data.expires_in_sec || data.expires_in || DEFAULT_TTL;
+
+      if (!sessionId) {
+        throw new Error("Invalid response from server: session_id is missing");
       }
 
       termRef.current?.clear();
       termRef.current?.reset();
-      attachWebSocket(data.container_id, DEFAULT_TTL);
+      attachWebSocket(sessionId, ttl);
     } catch (err) {
-      const errMsg = err.message || "Failed to initiate container session";
-      console.warn("Session launch failed:", errMsg);
+      const errMsg = err.message || "Failed to create sandbox session";
+      console.warn("Docpine session creation failed:", errMsg);
       setDiagnosticError(errMsg);
       setShowDiagnostics(true);
       showToast("Launch Failed", errMsg, "error");
     } finally {
       setConnecting(false);
+      setPowSolving(false);
     }
-  }, [connecting, attachWebSocket, showToast]);
+  }, [connecting, rateLimitCountdown, apiBaseUrl, attachWebSocket, showToast]);
 
   // --------------------------------------------------------------------------
   // KILL / TERMINATE SESSION
@@ -533,7 +702,7 @@ export default function DocpineTerminal() {
     }
     termRef.current?.writeln("\r\n\x1b[38;2;255;71;87m[session terminated by user]\x1b[0m\r\n");
     setSession(s => (s ? { ...s, status: "expired" } : null));
-    showToast("Session Terminated", "Container process killed", "info");
+    showToast("Session Terminated", "Sandbox process destroyed", "info");
   }, [showToast]);
 
   // --------------------------------------------------------------------------
@@ -550,11 +719,11 @@ export default function DocpineTerminal() {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(cmd + "\n");
     } else {
-      showToast("Terminal Inactive", "Start a session to run commands", "error");
+      showToast("Terminal Inactive", "Start a sandbox session to run commands", "error");
     }
   }, [showToast]);
 
-  const copyContainerId = useCallback(() => {
+  const copySessionId = useCallback(() => {
     if (!session?.id) return;
     navigator.clipboard.writeText(session.id);
     showToast("Copied to Clipboard", session.id, "success");
@@ -640,6 +809,20 @@ export default function DocpineTerminal() {
           </div>
         )}
 
+        {rateLimitCountdown > 0 && (
+          <div className="rate-limit-banner">
+            <span className="banner-icon">⏳</span>
+            <span>Rate limit active: retry in <strong>{rateLimitCountdown}s</strong></span>
+          </div>
+        )}
+
+        {capacityCountdown > 0 && (
+          <div className="capacity-limit-banner">
+            <span className="banner-icon">⚠️</span>
+            <span>Host at full capacity (20/20 active sandboxes). Wait <strong>{capacityCountdown}s</strong></span>
+          </div>
+        )}
+
         <div className="toast-container">
           {toasts.map(t => (
             <div key={t.id} className={`toast-card ${t.type}`}>
@@ -679,12 +862,13 @@ export default function DocpineTerminal() {
                   </svg>
                   docpine
                 </span>
+                <span className="badge-pill">sandbox</span>
               </div>
             </div>
 
             <div className="header-center">
               {session && (
-                <div className="container-chip" onClick={copyContainerId} title="Click to copy container ID">
+                <div className="container-chip" onClick={copySessionId} title="Click to copy Session ID">
                   <span>#{session.id.slice(0, 10)}</span>
                   <span className="copy-hint">📋</span>
                 </div>
@@ -693,7 +877,7 @@ export default function DocpineTerminal() {
 
             <div className="header-right">
               {session && (session.status === "running" || session.status === "expiring") && (
-                <div className="ttl-gauge-wrap">
+                <div className="ttl-gauge-wrap" title="Sandbox Lifetime (TTL)">
                   <svg className="gauge-svg" width="20" height="20">
                     <circle
                       className="gauge-track"
@@ -720,7 +904,7 @@ export default function DocpineTerminal() {
               )}
 
               {session && (session.status === "running" || session.status === "expiring") && (
-                <button className="action-btn kill" onClick={killSession} title="Kill session and delete container">
+                <button className="action-btn kill" onClick={killSession} title="Kill session and delete sandbox">
                   kill
                 </button>
               )}
@@ -729,7 +913,7 @@ export default function DocpineTerminal() {
                 <button
                   className="action-btn reconnect"
                   onClick={reconnectSession}
-                  disabled={connecting}
+                  disabled={connecting || rateLimitCountdown > 0}
                 >
                   {connecting ? "reconnecting..." : "restart"}
                 </button>
@@ -781,22 +965,24 @@ export default function DocpineTerminal() {
                   <div className="overlay-icon-wrap expired">
                     ⏳
                   </div>
-                  <h3 className="overlay-title">Session Expired</h3>
+                  <h3 className="overlay-title">Sandbox Expired</h3>
                   <p className="overlay-desc">
-                    The container lifetime completed or was closed. All temporary storage was safely destroyed.
+                    The ephemeral sandbox lifetime completed or was closed. All temporary container files and processes were safely destroyed.
                   </p>
                   <button
                     className="launch-btn"
                     onClick={reconnectSession}
-                    disabled={connecting}
+                    disabled={connecting || rateLimitCountdown > 0}
                   >
                     {connecting ? (
                       <>
                         <span className="spinner" />
-                        <span>Initializing Container...</span>
+                        <span>{powSolving ? "Solving Security Challenge..." : "Initializing Sandbox..."}</span>
                       </>
+                    ) : rateLimitCountdown > 0 ? (
+                      <span>Wait {rateLimitCountdown}s (Rate Limited)</span>
                     ) : (
-                      <span>Start New Session</span>
+                      <span>Start New Sandbox Session</span>
                     )}
                   </button>
                 </div>
@@ -812,24 +998,32 @@ export default function DocpineTerminal() {
                 </svg>
               </div>
 
-              <h1 className="launcher-title">Ephemeral Container Shell</h1>
+              <h1 className="launcher-title">Ephemeral Sandbox Terminal</h1>
               <p className="launcher-subtitle">
-                Ultra-fast isolated container terminal with real-time WebSocket PTY streaming and auto-teardown.
+                Ultra-fast isolated sandbox container shell with real-time Two-Lane WebSocket PTY streaming and automated abuse protection.
               </p>
 
               <button
                 className="launch-btn"
                 onClick={startSession}
-                disabled={connecting}
+                disabled={connecting || rateLimitCountdown > 0}
               >
                 {connecting ? (
                   <>
                     <span className="spinner" />
-                    <span>Provisioning Session...</span>
+                    <span>{powSolving ? "⚡ Solving Security Challenge..." : "Provisioning Sandbox..."}</span>
+                  </>
+                ) : rateLimitCountdown > 0 ? (
+                  <>
+                    <span>⏳ Rate Limited (Retry in {rateLimitCountdown}s)</span>
+                  </>
+                ) : capacityCountdown > 0 ? (
+                  <>
+                    <span>⚠️ Host Full (Retry in {capacityCountdown}s)</span>
                   </>
                 ) : (
                   <>
-                    <span>⚡ Start Terminal Session</span>
+                    <span>⚡ Start Sandbox Session</span>
                   </>
                 )}
               </button>
@@ -856,11 +1050,19 @@ export default function DocpineTerminal() {
                 />
                 <span>
                   {session?.status === "running"
-                    ? "Live PTY Connected"
+                    ? "Live Two-Lane PTY Connected"
                     : session?.status === "expiring"
                     ? "Session Expiring"
+                    : powSolving
+                    ? "Solving PoW Challenge..."
+                    : rateLimitCountdown > 0
+                    ? `Rate Limited (${rateLimitCountdown}s)`
+                    : capacityCountdown > 0
+                    ? `Host Full (${capacityCountdown}s)`
                     : backendAlive
-                    ? "Backend Ready (:8080)"
+                    ? healthData?.active_sessions !== undefined
+                      ? `Backend Ready (${healthData.active_sessions}/${healthData.max_capacity || 20} Sandboxes)`
+                      : "Backend Ready (:8080)"
                     : "Backend Standby"}
                 </span>
               </div>
@@ -885,21 +1087,22 @@ export default function DocpineTerminal() {
             <div className="modal-card" onClick={e => e.stopPropagation()}>
               <div className="modal-header">
                 <h3 className="modal-title" style={{ color: "#ff4757", display: "flex", alignItems: "center", gap: 8 }}>
-                  🔌 Backend Connection Failed
+                  🔌 Backend Connection Notice
                 </h3>
                 <button className="icon-btn" onClick={() => setShowDiagnostics(false)}>✕</button>
               </div>
               <div className="modal-body">
                 <p className="overlay-desc">
-                  Docpine UI was unable to reach the Docker backend service on <code style={{ color: "#00f5a0" }}>{DEFAULT_API_BASE}</code>.
+                  Docpine UI was unable to create a sandbox session on <code style={{ color: "#00f5a0" }}>{apiBaseUrl}</code>.
                 </p>
                 <div className="diagnostic-box">
                   {diagnosticError || "Connection refused (ERR_CONNECTION_REFUSED)"}
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 8, fontSize: 12, color: "#94a3b8" }}>
                   <div>💡 <strong>Troubleshooting Steps:</strong></div>
-                  <div>1. Ensure the Docpine backend is running: <code>go run ./cmd/docpine</code></div>
-                  <div>2. Verify Docker daemon is running and healthy.</div>
+                  <div>1. Ensure the Docpine backend service is running on <code>{apiBaseUrl}</code>.</div>
+                  <div>2. Verify CORS allows origin and <code>credentials: include</code> headers.</div>
+                  <div>3. Check if rate limits (429) or host capacity limits (503) are active.</div>
                 </div>
               </div>
               <div className="modal-footer">
@@ -910,8 +1113,9 @@ export default function DocpineTerminal() {
                     setShowDiagnostics(false);
                     startSession();
                   }}
+                  disabled={rateLimitCountdown > 0}
                 >
-                  🔄 Retry Connection
+                  🔄 Retry Session
                 </button>
               </div>
             </div>
@@ -921,3 +1125,5 @@ export default function DocpineTerminal() {
     </ErrorBoundary>
   );
 }
+
+export default DocpineTerminal;
