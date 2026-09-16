@@ -239,6 +239,18 @@ export function DocpineTerminal({
   const [toasts, setToasts] = useState([]);
   const [turnstileToken, setTurnstileToken] = useState("");
 
+  const handleTurnstileSuccess = useCallback((token) => {
+    setTurnstileToken(token);
+  }, []);
+
+  const handleTurnstileExpire = useCallback(() => {
+    setTurnstileToken("");
+  }, []);
+
+  const handleTurnstileError = useCallback((err) => {
+    console.warn("Turnstile verification error:", err);
+  }, []);
+
   const wsRef = useRef(null);
   const termRef = useRef(null);
   const fitAddonRef = useRef(null);
@@ -899,9 +911,9 @@ export function DocpineTerminal({
                     <TurnstileWidget
                       ref={turnstileOverlayRef}
                       theme="dark"
-                      onSuccess={token => setTurnstileToken(token)}
-                      onExpire={() => setTurnstileToken("")}
-                      onError={err => console.warn("Turnstile verification error:", err)}
+                      onSuccess={handleTurnstileSuccess}
+                      onExpire={handleTurnstileExpire}
+                      onError={handleTurnstileError}
                     />
                   </div>
 
@@ -943,9 +955,9 @@ export function DocpineTerminal({
                 <TurnstileWidget
                   ref={turnstileRef}
                   theme="dark"
-                  onSuccess={token => setTurnstileToken(token)}
-                  onExpire={() => setTurnstileToken("")}
-                  onError={err => console.warn("Turnstile verification error:", err)}
+                  onSuccess={handleTurnstileSuccess}
+                  onExpire={handleTurnstileExpire}
+                  onError={handleTurnstileError}
                 />
               </div>
 
