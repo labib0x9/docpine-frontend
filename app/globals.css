@@ -680,7 +680,39 @@ html, body, #root {
   color: #8fa0ac;
   max-width: 440px;
   line-height: 1.6;
-  margin-bottom: 28px;
+  margin-bottom: 24px;
+}
+
+.turnstile-wrapper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 20px;
+  min-height: 65px;
+  padding: 4px;
+  border-radius: var(--radius-md);
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  transition: all var(--transition-fast);
+}
+
+.turnstile-wrapper:hover {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.turnstile-wrapper.overlay-mode {
+  width: 100%;
+  margin-top: 4px;
+  margin-bottom: 12px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--theme-border, #1f2c34);
+}
+
+.turnstile-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .launch-btn {

@@ -1,3 +1,4 @@
+import Script from "next/script";
 import { Inter, JetBrains_Mono, Outfit } from "next/font/google";
 import "./globals.css";
 
@@ -38,7 +39,14 @@ export default function RootLayout({ children }) {
       lang="en"
       className={`${inter.variable} ${jetbrainsMono.variable} ${outfit.variable}`}
     >
+      <head>
+        <Script
+          src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+          strategy="afterInteractive"
+        />
+      </head>
       <body>{children}</body>
     </html>
   );
 }
+

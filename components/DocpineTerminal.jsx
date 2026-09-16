@@ -5,14 +5,15 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import ErrorBoundary from "./ErrorBoundary";
-import { solvePoW } from "../lib/powSolver";
+import TurnstileWidget from "./TurnstileWidget";
 
 // ============================================================================
 // CONFIGURATION & THEMES
 // ============================================================================
 const DEFAULT_TTL = 300; // 5 minutes in seconds
-const ENV_API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8080";
-const ENV_WS_BASE = process.env.NEXT_PUBLIC_WS_BASE || "ws://127.0.0.1:8080";
+const ENV_API_BASE = process.env.NEXT_PUBLIC_API_BASE;
+const ENV_WS_BASE = process.env.NEXT_PUBLIC_WS_BASE;
+
 
 const THEMES = {
   emerald: {
@@ -227,7 +228,6 @@ export function DocpineTerminal({
 }) {
   const [session, setSession] = useState(null);
   const [connecting, setConnecting] = useState(false);
-  const [powSolving, setPowSolving] = useState(false);
   const [rateLimitCountdown, setRateLimitCountdown] = useState(0);
   const [capacityCountdown, setCapacityCountdown] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -237,8 +237,7 @@ export function DocpineTerminal({
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [diagnosticError, setDiagnosticError] = useState("");
   const [toasts, setToasts] = useState([]);
-  const [backendAlive, setBackendAlive] = useState(null);
-  const [healthData, setHealthData] = useState(null);
+  const [turnstileToken, setTurnstileToken] = useState("");
 
   const wsRef = useRef(null);
   const termRef = useRef(null);
@@ -246,6 +245,8 @@ export function DocpineTerminal({
   const termContainerRef = useRef(null);
   const manualCloseRef = useRef(false);
   const appContainerRef = useRef(null);
+  const turnstileRef = useRef(null);
+  const turnstileOverlayRef = useRef(null);
 
   const themeConfig = THEMES[currentTheme] || THEMES.emerald;
 
@@ -304,63 +305,9 @@ export function DocpineTerminal({
   }, [capacityCountdown]);
 
   // --------------------------------------------------------------------------
-  // BACKEND HEALTH PROBE (/healthz)
-  // --------------------------------------------------------------------------
-  useEffect(() => {
-    let isMounted = true;
-    const probe = async () => {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3000);
-
-        // Core Endpoint 1: GET /healthz with credentials: "include"
-        const res = await fetch(`${apiBaseUrl}/healthz`, {
-          method: "GET",
-          headers: { Accept: "application/json" },
-          credentials: "include",
-          signal: controller.signal,
-        }).catch(async () => {
-          // Fallback probe if /healthz route is not implemented yet
-          return await fetch(`${apiBaseUrl}/sessions`, {
-            method: "OPTIONS",
-            credentials: "include",
-            signal: controller.signal,
-          }).catch(() => null);
-        });
-
-        clearTimeout(timeoutId);
-
-        if (!isMounted) return;
-
-        if (res && (res.ok || res.status === 200 || res.status === 204)) {
-          setBackendAlive(true);
-          try {
-            const data = await res.json();
-            setHealthData(data);
-          } catch {
-            // Non-JSON response
-          }
-        } else if (res && res.status === 405) {
-          setBackendAlive(true);
-        } else {
-          setBackendAlive(false);
-        }
-      } catch {
-        if (isMounted) setBackendAlive(false);
-      }
-    };
-
-    probe();
-    const interval = setInterval(probe, 15000);
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
-    };
-  }, [apiBaseUrl]);
-
-  // --------------------------------------------------------------------------
   // INITIALIZE XTERM.JS
   // --------------------------------------------------------------------------
+
   useEffect(() => {
     if (!termContainerRef.current) return;
 
@@ -547,26 +494,28 @@ export function DocpineTerminal({
   }, [wsBaseUrl, showToast]);
 
   // --------------------------------------------------------------------------
-  // CREATE SESSION FLOW WITH PROOF-OF-WORK (PoW) & STATUS INTERCEPTION
+  // CREATE SESSION FLOW (Exact Cloudflare Turnstile Data)
   // --------------------------------------------------------------------------
   const startSession = useCallback(async () => {
     if (connecting || rateLimitCountdown > 0) return;
     setConnecting(true);
-    setPowSolving(false);
     setShowDiagnostics(false);
 
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 12000);
 
-      // Core Request: POST /sessions with credentials: "include" for __dp_dev cookie
+      // Send exact Cloudflare Turnstile token in request body
       let res = await fetch(`${apiBaseUrl}/sessions`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
         },
-        credentials: "include", // Required for __dp_dev signed cookie
+        credentials: "include", // Preserves __dp_dev signed cookie
+        body: JSON.stringify({
+          "cf-turnstile-response": turnstileToken,
+        }),
         signal: controller.signal,
       }).catch(err => {
         throw new Error(
@@ -576,38 +525,8 @@ export function DocpineTerminal({
         );
       });
 
-      // Handle 428 Precondition Required (Proof-of-Work puzzle challenge)
-      if (res.status === 428) {
-        setPowSolving(true);
-        showToast("Solving Security Challenge", "Computing browser Proof-of-Work...", "info", 2000);
-
-        const challengeData = await res.json();
-        if (!challengeData.pow_challenge) {
-          throw new Error("HTTP 428 received but pow_challenge payload is missing");
-        }
-
-        const t0 = performance.now();
-        const solution = await solvePoW(challengeData.pow_challenge);
-        const elapsed = Math.round(performance.now() - t0);
-
-        setPowSolving(false);
-        showToast("Challenge Solved", `PoW verified in ${elapsed}ms`, "success", 2000);
-
-        // Re-send POST /sessions with solved PoW solution
-        res = await fetch(`${apiBaseUrl}/sessions`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-          },
-          credentials: "include", // Preserves __dp_dev signed cookie
-          body: JSON.stringify({
-            pow_solution: solution,
-          }),
-        });
-      }
-
       clearTimeout(timeoutId);
+
 
       // Handle 429 Too Many Requests (Per-client rate limit exceeded)
       if (res.status === 429) {
@@ -676,6 +595,11 @@ export function DocpineTerminal({
         throw new Error("Invalid response from server: session_id is missing");
       }
 
+      // Reset Turnstile tokens for fresh next session
+      turnstileRef.current?.reset();
+      turnstileOverlayRef.current?.reset();
+      setTurnstileToken("");
+
       termRef.current?.clear();
       termRef.current?.reset();
       attachWebSocket(sessionId, ttl);
@@ -687,9 +611,10 @@ export function DocpineTerminal({
       showToast("Launch Failed", errMsg, "error");
     } finally {
       setConnecting(false);
-      setPowSolving(false);
     }
-  }, [connecting, rateLimitCountdown, apiBaseUrl, attachWebSocket, showToast]);
+  }, [connecting, rateLimitCountdown, apiBaseUrl, attachWebSocket, showToast, turnstileToken]);
+
+
 
   // --------------------------------------------------------------------------
   // KILL / TERMINATE SESSION
@@ -969,6 +894,17 @@ export function DocpineTerminal({
                   <p className="overlay-desc">
                     The ephemeral sandbox lifetime completed or was closed. All temporary container files and processes were safely destroyed.
                   </p>
+
+                  <div className="turnstile-wrapper overlay-mode">
+                    <TurnstileWidget
+                      ref={turnstileOverlayRef}
+                      theme="dark"
+                      onSuccess={token => setTurnstileToken(token)}
+                      onExpire={() => setTurnstileToken("")}
+                      onError={err => console.warn("Turnstile verification error:", err)}
+                    />
+                  </div>
+
                   <button
                     className="launch-btn"
                     onClick={reconnectSession}
@@ -977,7 +913,7 @@ export function DocpineTerminal({
                     {connecting ? (
                       <>
                         <span className="spinner" />
-                        <span>{powSolving ? "Solving Security Challenge..." : "Initializing Sandbox..."}</span>
+                        <span>Initializing Sandbox...</span>
                       </>
                     ) : rateLimitCountdown > 0 ? (
                       <span>Wait {rateLimitCountdown}s (Rate Limited)</span>
@@ -1003,6 +939,16 @@ export function DocpineTerminal({
                 Ultra-fast isolated sandbox container shell with real-time Two-Lane WebSocket PTY streaming and automated abuse protection.
               </p>
 
+              <div className="turnstile-wrapper">
+                <TurnstileWidget
+                  ref={turnstileRef}
+                  theme="dark"
+                  onSuccess={token => setTurnstileToken(token)}
+                  onExpire={() => setTurnstileToken("")}
+                  onError={err => console.warn("Turnstile verification error:", err)}
+                />
+              </div>
+
               <button
                 className="launch-btn"
                 onClick={startSession}
@@ -1011,7 +957,7 @@ export function DocpineTerminal({
                 {connecting ? (
                   <>
                     <span className="spinner" />
-                    <span>{powSolving ? "⚡ Solving Security Challenge..." : "Provisioning Sandbox..."}</span>
+                    <span>Provisioning Sandbox...</span>
                   </>
                 ) : rateLimitCountdown > 0 ? (
                   <>
@@ -1027,6 +973,7 @@ export function DocpineTerminal({
                   </>
                 )}
               </button>
+
 
               <div className="shortcut-hints">
                 <span><span className="kbd">Ctrl</span> + <span className="kbd">L</span> Clear</span>
@@ -1045,7 +992,7 @@ export function DocpineTerminal({
                       ? "online"
                       : session?.status === "expiring"
                       ? "warning"
-                      : "error"
+                      : ""
                   }`}
                 />
                 <span>
@@ -1053,18 +1000,14 @@ export function DocpineTerminal({
                     ? "Live Two-Lane PTY Connected"
                     : session?.status === "expiring"
                     ? "Session Expiring"
-                    : powSolving
-                    ? "Solving PoW Challenge..."
                     : rateLimitCountdown > 0
                     ? `Rate Limited (${rateLimitCountdown}s)`
                     : capacityCountdown > 0
                     ? `Host Full (${capacityCountdown}s)`
-                    : backendAlive
-                    ? healthData?.active_sessions !== undefined
-                      ? `Backend Ready (${healthData.active_sessions}/${healthData.max_capacity || 20} Sandboxes)`
-                      : "Backend Ready (:8080)"
-                    : "Backend Standby"}
+                    : "Docpine Ephemeral Sandbox"}
                 </span>
+
+
               </div>
               <div className="status-item">
                 <span>Theme: {themeConfig.name}</span>
