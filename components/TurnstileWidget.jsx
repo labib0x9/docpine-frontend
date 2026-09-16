@@ -20,6 +20,17 @@ export const TurnstileWidget = forwardRef(function TurnstileWidget(
   const widgetIdRef = useRef(null);
   const isMountedRef = useRef(true);
 
+  // Store latest callbacks in refs to avoid triggering re-mounts on inline prop functions
+  const onSuccessRef = useRef(onSuccess);
+  const onExpireRef = useRef(onExpire);
+  const onErrorRef = useRef(onError);
+
+  useEffect(() => {
+    onSuccessRef.current = onSuccess;
+    onExpireRef.current = onExpire;
+    onErrorRef.current = onError;
+  });
+
   // Expose imperative methods to parent (e.g. reset)
   const reset = useCallback(() => {
     if (typeof window !== "undefined" && window.turnstile && widgetIdRef.current !== null) {
@@ -71,18 +82,18 @@ export const TurnstileWidget = forwardRef(function TurnstileWidget(
           theme: theme === "light" ? "light" : "dark",
           size: size,
           callback: token => {
-            if (isMountedRef.current && onSuccess) {
-              onSuccess(token);
+            if (isMountedRef.current && onSuccessRef.current) {
+              onSuccessRef.current(token);
             }
           },
           "expired-callback": () => {
-            if (isMountedRef.current && onExpire) {
-              onExpire();
+            if (isMountedRef.current && onExpireRef.current) {
+              onExpireRef.current();
             }
           },
           "error-callback": err => {
-            if (isMountedRef.current && onError) {
-              onError(err);
+            if (isMountedRef.current && onErrorRef.current) {
+              onErrorRef.current(err);
             }
           },
         });
@@ -118,7 +129,7 @@ export const TurnstileWidget = forwardRef(function TurnstileWidget(
         widgetIdRef.current = null;
       }
     };
-  }, [siteKey, theme, size, onSuccess, onExpire, onError]);
+  }, [siteKey, theme, size]);
 
   return (
     <div className={`turnstile-container ${className}`}>
