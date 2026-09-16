@@ -5,13 +5,15 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import ErrorBoundary from "./ErrorBoundary";
+import TurnstileWidget from "./TurnstileWidget";
 
 // ============================================================================
 // CONFIGURATION & THEMES
 // ============================================================================
 const DEFAULT_TTL = 300; // 5 minutes in seconds
-const DEFAULT_API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8080";
-const DEFAULT_WS_BASE = process.env.NEXT_PUBLIC_WS_BASE || "ws://127.0.0.1:8080";
+const ENV_API_BASE = process.env.NEXT_PUBLIC_API_BASE;
+const ENV_WS_BASE = process.env.NEXT_PUBLIC_WS_BASE;
+
 
 const THEMES = {
   emerald: {
@@ -220,17 +222,22 @@ function fmtTTL(seconds) {
 // ============================================================================
 // MAIN TERMINAL COMPONENT
 // ============================================================================
-export default function DocpineTerminal() {
+export function DocpineTerminal({
+  apiBaseUrl = ENV_API_BASE,
+  wsBaseUrl = ENV_WS_BASE,
+}) {
   const [session, setSession] = useState(null);
   const [connecting, setConnecting] = useState(false);
+  const [rateLimitCountdown, setRateLimitCountdown] = useState(0);
+  const [capacityCountdown, setCapacityCountdown] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [currentTheme, setCurrentTheme] = useState("emerald");
   const [fontSize, setFontSize] = useState(13);
-  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [isOnline, setIsOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [diagnosticError, setDiagnosticError] = useState("");
   const [toasts, setToasts] = useState([]);
-  const [backendAlive, setBackendAlive] = useState(null);
+  const [turnstileToken, setTurnstileToken] = useState("");
 
   const wsRef = useRef(null);
   const termRef = useRef(null);
@@ -238,6 +245,8 @@ export default function DocpineTerminal() {
   const termContainerRef = useRef(null);
   const manualCloseRef = useRef(false);
   const appContainerRef = useRef(null);
+  const turnstileRef = useRef(null);
+  const turnstileOverlayRef = useRef(null);
 
   const themeConfig = THEMES[currentTheme] || THEMES.emerald;
 
@@ -256,6 +265,7 @@ export default function DocpineTerminal() {
   // NETWORK MONITORING
   // --------------------------------------------------------------------------
   useEffect(() => {
+    if (typeof window === "undefined") return;
     const handleOnline = () => {
       setIsOnline(true);
       showToast("Network Connected", "Internet connection restored", "success");
@@ -273,38 +283,31 @@ export default function DocpineTerminal() {
   }, [showToast]);
 
   // --------------------------------------------------------------------------
-  // BACKEND HEALTH PROBE
+  // RATE LIMIT COUNTDOWN TICKER
   // --------------------------------------------------------------------------
   useEffect(() => {
-    let isMounted = true;
-    const probe = async () => {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 2000);
-        const res = await fetch(`${DEFAULT_API_BASE}/sessions`, {
-          method: "OPTIONS",
-          signal: controller.signal,
-        }).catch(() => null);
-        clearTimeout(timeoutId);
-        if (isMounted) {
-          setBackendAlive(Boolean(res && (res.ok || res.status === 405 || res.status === 200 || res.status === 204)));
-        }
-      } catch {
-        if (isMounted) setBackendAlive(false);
-      }
-    };
+    if (rateLimitCountdown <= 0) return;
+    const timer = setInterval(() => {
+      setRateLimitCountdown(prev => (prev > 1 ? prev - 1 : 0));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [rateLimitCountdown]);
 
-    probe();
-    const interval = setInterval(probe, 15000);
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
-    };
-  }, []);
+  // --------------------------------------------------------------------------
+  // CAPACITY LIMIT COUNTDOWN TICKER
+  // --------------------------------------------------------------------------
+  useEffect(() => {
+    if (capacityCountdown <= 0) return;
+    const timer = setInterval(() => {
+      setCapacityCountdown(prev => (prev > 1 ? prev - 1 : 0));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [capacityCountdown]);
 
   // --------------------------------------------------------------------------
   // INITIALIZE XTERM.JS
   // --------------------------------------------------------------------------
+
   useEffect(() => {
     if (!termContainerRef.current) return;
 
@@ -325,9 +328,17 @@ export default function DocpineTerminal() {
     term.open(termContainerRef.current);
     fitAddon.fit();
 
+    // Lane 1: Stream keystrokes from xterm.js directly to PTY stdin
     term.onData(data => {
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(data);
+      }
+    });
+
+    // Lane 2: Handle terminal resize events (out-of-band JSON control message)
+    term.onResize(({ cols, rows }) => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "resize", cols, rows }));
       }
     });
 
@@ -392,7 +403,7 @@ export default function DocpineTerminal() {
         if (nextRemaining <= 0) {
           manualCloseRef.current = true;
           wsRef.current?.close(1000, "TTL Expired");
-          termRef.current?.writeln("\r\n\x1b[38;2;255;71;87m[session expired — container destroyed]\x1b[0m\r\n");
+          termRef.current?.writeln("\r\n\x1b[38;2;255;71;87m[session expired — sandbox destroyed]\x1b[0m\r\n");
           return { ...s, remaining: 0, status: "expired" };
         }
 
@@ -405,12 +416,12 @@ export default function DocpineTerminal() {
   }, [sessionStatus]);
 
   // --------------------------------------------------------------------------
-  // WEBSOCKET ATTACHMENT WITH COMPLETE ERROR HANDLERS
+  // TWO-LANE WEBSOCKET PTY STREAM ATTACHMENT
   // --------------------------------------------------------------------------
-  const attachWebSocket = useCallback((containerId, totalTime) => {
+  const attachWebSocket = useCallback((sessionId, totalTime) => {
     manualCloseRef.current = false;
 
-    let wsUrl = `${DEFAULT_WS_BASE}/sessions/${containerId}/attach`;
+    let wsUrl = `${wsBaseUrl}/sessions/${sessionId}/attach`;
     wsUrl = wsUrl.replace(/([^:]\/)\/+/g, "$1");
 
     let isConnected = false;
@@ -424,24 +435,37 @@ export default function DocpineTerminal() {
         showToast("Connection Timeout", "WebSocket handshake timed out", "error");
         setSession(s => (s ? { ...s, status: "expired" } : null));
       }
-    }, 8000);
+    }, 10000);
 
     ws.onopen = () => {
       isConnected = true;
       clearTimeout(connectTimeout);
       setSession({
-        id: containerId,
+        id: sessionId,
         status: totalTime <= 60 ? "expiring" : "running",
         remaining: totalTime,
         totalTTL: totalTime,
       });
-      showToast("Connected to Container", `Session #${containerId.slice(0, 8)} attached`, "success");
+
+      // Send initial terminal dimensions (Lane 2 Control Message)
+      if (termRef.current) {
+        ws.send(
+          JSON.stringify({
+            type: "resize",
+            cols: termRef.current.cols,
+            rows: termRef.current.rows,
+          })
+        );
+      }
+
+      showToast("Sandbox Attached", `Session #${sessionId.slice(0, 8)} connected`, "success");
       window.requestAnimationFrame(() => {
         fitAddonRef.current?.fit();
         termRef.current?.focus();
       });
     };
 
+    // Lane 1: Stream PTY Output from container directly to xterm.js
     ws.onmessage = event => {
       termRef.current?.write(event.data);
     };
@@ -450,14 +474,14 @@ export default function DocpineTerminal() {
       clearTimeout(connectTimeout);
       if (manualCloseRef.current) return;
 
-      let reasonText = "Session disconnected";
+      let reasonText = "Session disconnected (Sandbox destroyed)";
       if (event.code === 1006) {
-        reasonText = "Abnormal disconnection (server dropped connection)";
+        reasonText = "Abnormal disconnection (Server dropped stream)";
       } else if (event.reason) {
         reasonText = `Disconnected: ${event.reason}`;
       }
 
-      termRef.current?.writeln(`\r\n\x1b[33m[${reasonText}]\x1b[0m\r\n`);
+      termRef.current?.writeln(`\r\n\x1b[31m[Session terminated — ${reasonText}]\x1b[0m\r\n`);
       showToast("Session Disconnected", reasonText, "error");
       setSession(s => (s ? { ...s, status: "expired" } : null));
     };
@@ -465,62 +489,132 @@ export default function DocpineTerminal() {
     ws.onerror = () => {
       clearTimeout(connectTimeout);
       termRef.current?.writeln("\r\n\x1b[31m[WebSocket stream error encountered]\x1b[0m");
-      showToast("WebSocket Error", "An error occurred with the socket connection", "error");
+      showToast("WebSocket Error", "An error occurred with the socket stream", "error");
     };
-  }, [showToast]);
+  }, [wsBaseUrl, showToast]);
 
   // --------------------------------------------------------------------------
-  // START LIVE DOCKER CONTAINER SESSION
+  // CREATE SESSION FLOW (Exact Cloudflare Turnstile Data)
   // --------------------------------------------------------------------------
   const startSession = useCallback(async () => {
-    if (connecting) return;
+    if (connecting || rateLimitCountdown > 0) return;
     setConnecting(true);
     setShowDiagnostics(false);
 
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 6000);
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
 
-      const res = await fetch(`${DEFAULT_API_BASE}/sessions`, {
+      // Send exact Cloudflare Turnstile token in request body
+      let res = await fetch(`${apiBaseUrl}/sessions`, {
         method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        credentials: "include", // Preserves __dp_dev signed cookie
+        body: JSON.stringify({
+          "cf-turnstile-response": turnstileToken,
+        }),
         signal: controller.signal,
       }).catch(err => {
-        throw new Error(err.name === "AbortError" ? "Backend request timed out (6s)" : `Cannot reach ${DEFAULT_API_BASE}. Is the Docpine Go backend running?`);
+        throw new Error(
+          err.name === "AbortError"
+            ? "Backend request timed out (12s)"
+            : `Cannot reach ${apiBaseUrl}. Is the Docpine backend running?`
+        );
       });
 
       clearTimeout(timeoutId);
+
+
+      // Handle 429 Too Many Requests (Per-client rate limit exceeded)
+      if (res.status === 429) {
+        const retryHeader = res.headers.get("Retry-After");
+        let retrySeconds = retryHeader ? parseInt(retryHeader, 10) : 15;
+
+        try {
+          const errData = await res.json();
+          if (errData.retry_after && typeof errData.retry_after === "number") {
+            retrySeconds = errData.retry_after;
+          }
+        } catch {
+          // Ignore JSON parse errors on error responses
+        }
+
+        if (isNaN(retrySeconds) || retrySeconds <= 0) retrySeconds = 15;
+        setRateLimitCountdown(retrySeconds);
+        showToast("Rate Limit Exceeded", `Please wait ${retrySeconds}s before creating a sandbox.`, "error", 5000);
+        return;
+      }
+
+      // Handle 503 Service Unavailable (Global 20-container capacity reached)
+      if (res.status === 503) {
+        const retryHeader = res.headers.get("Retry-After");
+        let retrySeconds = retryHeader ? parseInt(retryHeader, 10) : 30;
+
+        try {
+          const errData = await res.json();
+          if (errData.retry_after && typeof errData.retry_after === "number") {
+            retrySeconds = errData.retry_after;
+          }
+        } catch {
+          // Ignore JSON parse errors
+        }
+
+        if (isNaN(retrySeconds) || retrySeconds <= 0) retrySeconds = 30;
+        setCapacityCountdown(retrySeconds);
+        showToast(
+          "Host At Maximum Capacity",
+          "All 20/20 sandboxes are active. Please wait a moment.",
+          "error",
+          6000
+        );
+        return;
+      }
 
       if (!res.ok) {
         let errDetail = `HTTP ${res.status}: ${res.statusText}`;
         try {
           const errData = await res.json();
           if (errData.error || errData.message) {
-            errDetail = errData.error || errData.message;
+            errDetail = errData.message || errData.error;
           }
         } catch {
-          // ignore non-json error responses
+          // Non-JSON error body
         }
         throw new Error(errDetail);
       }
 
+      // Success Response (HTTP 201 Created or HTTP 200)
       const data = await res.json();
-      if (!data.container_id) {
-        throw new Error("Invalid response from server: container_id missing");
+      const sessionId = data.session_id || data.container_id;
+      const ttl = data.expires_in_sec || data.expires_in || DEFAULT_TTL;
+
+      if (!sessionId) {
+        throw new Error("Invalid response from server: session_id is missing");
       }
+
+      // Reset Turnstile tokens for fresh next session
+      turnstileRef.current?.reset();
+      turnstileOverlayRef.current?.reset();
+      setTurnstileToken("");
 
       termRef.current?.clear();
       termRef.current?.reset();
-      attachWebSocket(data.container_id, DEFAULT_TTL);
+      attachWebSocket(sessionId, ttl);
     } catch (err) {
-      const errMsg = err.message || "Failed to initiate container session";
-      console.warn("Session launch failed:", errMsg);
+      const errMsg = err.message || "Failed to create sandbox session";
+      console.warn("Docpine session creation failed:", errMsg);
       setDiagnosticError(errMsg);
       setShowDiagnostics(true);
       showToast("Launch Failed", errMsg, "error");
     } finally {
       setConnecting(false);
     }
-  }, [connecting, attachWebSocket, showToast]);
+  }, [connecting, rateLimitCountdown, apiBaseUrl, attachWebSocket, showToast, turnstileToken]);
+
+
 
   // --------------------------------------------------------------------------
   // KILL / TERMINATE SESSION
@@ -533,7 +627,7 @@ export default function DocpineTerminal() {
     }
     termRef.current?.writeln("\r\n\x1b[38;2;255;71;87m[session terminated by user]\x1b[0m\r\n");
     setSession(s => (s ? { ...s, status: "expired" } : null));
-    showToast("Session Terminated", "Container process killed", "info");
+    showToast("Session Terminated", "Sandbox process destroyed", "info");
   }, [showToast]);
 
   // --------------------------------------------------------------------------
@@ -550,11 +644,11 @@ export default function DocpineTerminal() {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(cmd + "\n");
     } else {
-      showToast("Terminal Inactive", "Start a session to run commands", "error");
+      showToast("Terminal Inactive", "Start a sandbox session to run commands", "error");
     }
   }, [showToast]);
 
-  const copyContainerId = useCallback(() => {
+  const copySessionId = useCallback(() => {
     if (!session?.id) return;
     navigator.clipboard.writeText(session.id);
     showToast("Copied to Clipboard", session.id, "success");
@@ -640,6 +734,20 @@ export default function DocpineTerminal() {
           </div>
         )}
 
+        {rateLimitCountdown > 0 && (
+          <div className="rate-limit-banner">
+            <span className="banner-icon">⏳</span>
+            <span>Rate limit active: retry in <strong>{rateLimitCountdown}s</strong></span>
+          </div>
+        )}
+
+        {capacityCountdown > 0 && (
+          <div className="capacity-limit-banner">
+            <span className="banner-icon">⚠️</span>
+            <span>Host at full capacity (20/20 active sandboxes). Wait <strong>{capacityCountdown}s</strong></span>
+          </div>
+        )}
+
         <div className="toast-container">
           {toasts.map(t => (
             <div key={t.id} className={`toast-card ${t.type}`}>
@@ -679,12 +787,13 @@ export default function DocpineTerminal() {
                   </svg>
                   docpine
                 </span>
+                <span className="badge-pill">sandbox</span>
               </div>
             </div>
 
             <div className="header-center">
               {session && (
-                <div className="container-chip" onClick={copyContainerId} title="Click to copy container ID">
+                <div className="container-chip" onClick={copySessionId} title="Click to copy Session ID">
                   <span>#{session.id.slice(0, 10)}</span>
                   <span className="copy-hint">📋</span>
                 </div>
@@ -693,7 +802,7 @@ export default function DocpineTerminal() {
 
             <div className="header-right">
               {session && (session.status === "running" || session.status === "expiring") && (
-                <div className="ttl-gauge-wrap">
+                <div className="ttl-gauge-wrap" title="Sandbox Lifetime (TTL)">
                   <svg className="gauge-svg" width="20" height="20">
                     <circle
                       className="gauge-track"
@@ -720,7 +829,7 @@ export default function DocpineTerminal() {
               )}
 
               {session && (session.status === "running" || session.status === "expiring") && (
-                <button className="action-btn kill" onClick={killSession} title="Kill session and delete container">
+                <button className="action-btn kill" onClick={killSession} title="Kill session and delete sandbox">
                   kill
                 </button>
               )}
@@ -729,7 +838,7 @@ export default function DocpineTerminal() {
                 <button
                   className="action-btn reconnect"
                   onClick={reconnectSession}
-                  disabled={connecting}
+                  disabled={connecting || rateLimitCountdown > 0}
                 >
                   {connecting ? "reconnecting..." : "restart"}
                 </button>
@@ -781,22 +890,35 @@ export default function DocpineTerminal() {
                   <div className="overlay-icon-wrap expired">
                     ⏳
                   </div>
-                  <h3 className="overlay-title">Session Expired</h3>
+                  <h3 className="overlay-title">Sandbox Expired</h3>
                   <p className="overlay-desc">
-                    The container lifetime completed or was closed. All temporary storage was safely destroyed.
+                    The ephemeral sandbox lifetime completed or was closed. All temporary container files and processes were safely destroyed.
                   </p>
+
+                  <div className="turnstile-wrapper overlay-mode">
+                    <TurnstileWidget
+                      ref={turnstileOverlayRef}
+                      theme="dark"
+                      onSuccess={token => setTurnstileToken(token)}
+                      onExpire={() => setTurnstileToken("")}
+                      onError={err => console.warn("Turnstile verification error:", err)}
+                    />
+                  </div>
+
                   <button
                     className="launch-btn"
                     onClick={reconnectSession}
-                    disabled={connecting}
+                    disabled={connecting || rateLimitCountdown > 0}
                   >
                     {connecting ? (
                       <>
                         <span className="spinner" />
-                        <span>Initializing Container...</span>
+                        <span>Initializing Sandbox...</span>
                       </>
+                    ) : rateLimitCountdown > 0 ? (
+                      <span>Wait {rateLimitCountdown}s (Rate Limited)</span>
                     ) : (
-                      <span>Start New Session</span>
+                      <span>Start New Sandbox Session</span>
                     )}
                   </button>
                 </div>
@@ -812,27 +934,46 @@ export default function DocpineTerminal() {
                 </svg>
               </div>
 
-              <h1 className="launcher-title">Ephemeral Container Shell</h1>
+              <h1 className="launcher-title">Ephemeral Sandbox Terminal</h1>
               <p className="launcher-subtitle">
-                Ultra-fast isolated container terminal with real-time WebSocket PTY streaming and auto-teardown.
+                Ultra-fast isolated sandbox container shell with real-time Two-Lane WebSocket PTY streaming and automated abuse protection.
               </p>
+
+              <div className="turnstile-wrapper">
+                <TurnstileWidget
+                  ref={turnstileRef}
+                  theme="dark"
+                  onSuccess={token => setTurnstileToken(token)}
+                  onExpire={() => setTurnstileToken("")}
+                  onError={err => console.warn("Turnstile verification error:", err)}
+                />
+              </div>
 
               <button
                 className="launch-btn"
                 onClick={startSession}
-                disabled={connecting}
+                disabled={connecting || rateLimitCountdown > 0}
               >
                 {connecting ? (
                   <>
                     <span className="spinner" />
-                    <span>Provisioning Session...</span>
+                    <span>Provisioning Sandbox...</span>
+                  </>
+                ) : rateLimitCountdown > 0 ? (
+                  <>
+                    <span>⏳ Rate Limited (Retry in {rateLimitCountdown}s)</span>
+                  </>
+                ) : capacityCountdown > 0 ? (
+                  <>
+                    <span>⚠️ Host Full (Retry in {capacityCountdown}s)</span>
                   </>
                 ) : (
                   <>
-                    <span>⚡ Start Terminal Session</span>
+                    <span>⚡ Start Sandbox Session</span>
                   </>
                 )}
               </button>
+
 
               <div className="shortcut-hints">
                 <span><span className="kbd">Ctrl</span> + <span className="kbd">L</span> Clear</span>
@@ -851,18 +992,22 @@ export default function DocpineTerminal() {
                       ? "online"
                       : session?.status === "expiring"
                       ? "warning"
-                      : "error"
+                      : ""
                   }`}
                 />
                 <span>
                   {session?.status === "running"
-                    ? "Live PTY Connected"
+                    ? "Live Two-Lane PTY Connected"
                     : session?.status === "expiring"
                     ? "Session Expiring"
-                    : backendAlive
-                    ? "Backend Ready (:8080)"
-                    : "Backend Standby"}
+                    : rateLimitCountdown > 0
+                    ? `Rate Limited (${rateLimitCountdown}s)`
+                    : capacityCountdown > 0
+                    ? `Host Full (${capacityCountdown}s)`
+                    : "Docpine Ephemeral Sandbox"}
                 </span>
+
+
               </div>
               <div className="status-item">
                 <span>Theme: {themeConfig.name}</span>
@@ -885,21 +1030,22 @@ export default function DocpineTerminal() {
             <div className="modal-card" onClick={e => e.stopPropagation()}>
               <div className="modal-header">
                 <h3 className="modal-title" style={{ color: "#ff4757", display: "flex", alignItems: "center", gap: 8 }}>
-                  🔌 Backend Connection Failed
+                  🔌 Backend Connection Notice
                 </h3>
                 <button className="icon-btn" onClick={() => setShowDiagnostics(false)}>✕</button>
               </div>
               <div className="modal-body">
                 <p className="overlay-desc">
-                  Docpine UI was unable to reach the Docker backend service on <code style={{ color: "#00f5a0" }}>{DEFAULT_API_BASE}</code>.
+                  Docpine UI was unable to create a sandbox session on <code style={{ color: "#00f5a0" }}>{apiBaseUrl}</code>.
                 </p>
                 <div className="diagnostic-box">
                   {diagnosticError || "Connection refused (ERR_CONNECTION_REFUSED)"}
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 8, fontSize: 12, color: "#94a3b8" }}>
                   <div>💡 <strong>Troubleshooting Steps:</strong></div>
-                  <div>1. Ensure the Docpine backend is running: <code>go run ./cmd/docpine</code></div>
-                  <div>2. Verify Docker daemon is running and healthy.</div>
+                  <div>1. Ensure the Docpine backend service is running on <code>{apiBaseUrl}</code>.</div>
+                  <div>2. Verify CORS allows origin and <code>credentials: include</code> headers.</div>
+                  <div>3. Check if rate limits (429) or host capacity limits (503) are active.</div>
                 </div>
               </div>
               <div className="modal-footer">
@@ -910,8 +1056,9 @@ export default function DocpineTerminal() {
                     setShowDiagnostics(false);
                     startSession();
                   }}
+                  disabled={rateLimitCountdown > 0}
                 >
-                  🔄 Retry Connection
+                  🔄 Retry Session
                 </button>
               </div>
             </div>
@@ -921,3 +1068,5 @@ export default function DocpineTerminal() {
     </ErrorBoundary>
   );
 }
+
+export default DocpineTerminal;

@@ -119,6 +119,63 @@ html, body, #root {
   animation: slideDown 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+.rate-limit-banner {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(245, 158, 11, 0.92);
+  backdrop-filter: blur(12px);
+  color: #0b0f19;
+  padding: 6px 18px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 8px 24px rgba(245, 158, 11, 0.35);
+  z-index: 9999;
+  animation: slideDown 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.capacity-limit-banner {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(239, 68, 68, 0.92);
+  backdrop-filter: blur(12px);
+  color: #fff;
+  padding: 6px 18px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 8px 24px rgba(239, 68, 68, 0.4);
+  z-index: 9999;
+  animation: slideDown 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.banner-icon {
+  font-size: 14px;
+}
+
+.badge-pill {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  background: rgba(0, 245, 160, 0.12);
+  color: var(--theme-primary, #00f5a0);
+  border: 1px solid rgba(0, 245, 160, 0.25);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
 @keyframes slideDown {
   from { opacity: 0; transform: translate(-50%, -20px); }
   to { opacity: 1; transform: translate(-50%, 0); }
@@ -623,7 +680,39 @@ html, body, #root {
   color: #8fa0ac;
   max-width: 440px;
   line-height: 1.6;
-  margin-bottom: 28px;
+  margin-bottom: 24px;
+}
+
+.turnstile-wrapper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 20px;
+  min-height: 65px;
+  padding: 4px;
+  border-radius: var(--radius-md);
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  transition: all var(--transition-fast);
+}
+
+.turnstile-wrapper:hover {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.turnstile-wrapper.overlay-mode {
+  width: 100%;
+  margin-top: 4px;
+  margin-bottom: 12px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--theme-border, #1f2c34);
+}
+
+.turnstile-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .launch-btn {
